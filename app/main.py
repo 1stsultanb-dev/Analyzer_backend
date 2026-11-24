@@ -249,31 +249,54 @@ def _analyses_between(start, end) -> int:
 
 
 async def _visits_report_loop() -> None:
-    """Раз в час: созрел ли период отчёта о посещениях (3 дня) — если да, в таблицу.
+    """Отчёт о посещениях в Google-таблицу.
 
-    Тем же проходом из базы уходят сырые визиты старше `VISITS_RETENTION_DAYS`.
+    Каждые `VISITS_LIVE_SECONDS` (30 с): закрыть созревшие периоды итогом и
+    переписать идущий, если в нём что-то изменилось. Без изменений Google не
+    трогается. При отказе Google пауза растёт вдвое до десяти минут — чтобы
+    недоступная таблица не забивала журнал и квоту. Раз в час из базы уходят
+    сырые визиты старше `VISITS_RETENTION_DAYS`.
+
     Удаляемый модуль: снимается вместе с `app/visits`.
     """
+    import time as _time
+
     from app.visits import collect, report, sheets
     from app.visits.config import visits_settings
 
-    await asyncio.sleep(180)
+    base = visits_settings.live_seconds or 3600
+    delay = base
+    purged_at = 0.0
+    await asyncio.sleep(20)
     while True:
         try:
-            removed = await asyncio.to_thread(collect.purge_old)
-            if removed:
-                log.info("visits: удалено старых записей учёта посещений: %s", removed)
+            if _time.monotonic() - purged_at >= 3600:
+                purged_at = _time.monotonic()
+                removed = await asyncio.to_thread(collect.purge_old)
+                if removed:
+                    log.info("visits: удалено старых записей учёта посещений: %s", removed)
             if visits_settings.report_configured:
-                sent = await asyncio.to_thread(
+                closed = await asyncio.to_thread(
                     report.run_due, sheets.send_report, analyses=_analyses_between
                 )
-                if sent:
-                    log.info("visits: отчётов о посещениях отправлено: %s", sent)
+                if closed:
+                    log.info("visits: закрыто периодов отчёта: %s", closed)
+                if visits_settings.live_seconds:
+                    await asyncio.to_thread(
+                        report.refresh_live, sheets.send_report, analyses=_analyses_between
+                    )
+            delay = base
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — отчёт не роняет приложение
-            log.warning("visits: отчёт о посещениях не ушёл (%s: %s)", type(exc).__name__, exc)
-        await asyncio.sleep(3600)
+            delay = min(600, max(base, delay * 2))
+            log.warning(
+                "visits: отчёт о посещениях не записан (%s: %s), повтор через %s с",
+                type(exc).__name__,
+                exc,
+                delay,
+            )
+        await asyncio.sleep(delay)
 
 
 async def _contract_amendments_loop() -> None:

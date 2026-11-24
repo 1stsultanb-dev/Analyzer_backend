@@ -1,12 +1,20 @@
 """Отчёт о посещениях за период → строки вкладок Google-таблицы.
 
 Периоды идут встык по `VISITS_REPORT_EVERY_DAYS` (3) суток от полуночи по
-Казахстану (UTC+5) — день начала учёта. Какой период ушёл последним, записано
-в `site_reports`: после простоя сервера отправятся все пропущенные по очереди,
-а сбой Google не сдвигает период — следующая попытка через час.
+Казахстану (UTC+5) — день начала учёта. Текущий период живой: его строки
+переписываются в таблице каждые `VISITS_LIVE_SECONDS` (30) секунд, если с
+прошлого раза что-то поменялось (`refresh_live`), и в сводке помечены «Идёт».
+Закрылся период — его строки пишутся последний раз со статусом «Итог»
+(`run_due`), и ниже начинает расти следующий.
 
-Каждая вкладка — длинная таблица с колонкой «Период» первой: новые отчёты
-дописываются снизу, а фильтр по периоду или сводная таблица строятся сами.
+Какой период закрыт последним, записано в `site_reports`: после простоя
+сервера закроются все пропущенные по очереди, а сбой Google не сдвигает
+период — следующая попытка в следующий проход.
+
+Каждая вкладка — длинная таблица с колонкой «Период» первой: фильтр по периоду
+или сводная таблица строятся сами. Запись периода идемпотентна — его строки
+заменяются целиком (`sheets.replace_period`), поэтому живые обновления и
+итоговая запись не плодят дублей.
 
 В маркетинговые цифры не попадают боты и сотрудники, вошедшие в «Финансы»:
 это не аудитория сайта. Их число — отдельными колонками сводки.
@@ -17,7 +25,7 @@ import logging
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 
@@ -49,12 +57,12 @@ TAB_VISITS = "Визиты"
 
 TABS: dict[str, list[str]] = {
     TAB_SUMMARY: [
-        "Период", "С", "По", "Уникальные посетители", "Новые", "Вернувшиеся", "Визиты",
+        "Период", "С", "По", "Статус", "Уникальные посетители", "Новые", "Вернувшиеся", "Визиты",
         "Просмотры страниц", "Просмотров на визит", "Средняя длительность визита, мин",
         "Активное время на визит, мин", "Отказы, %", "Выписок отправлено на анализ",
         "Конверсия посетителя в анализ, %", "Главный канал", "Главный источник",
         "Главная страна", "Доля телефонов, %", "Сотрудники на сайте (не в цифрах)",
-        "Визиты ботов (не в цифрах)", "Отчёт сформирован",
+        "Визиты ботов (не в цифрах)", "Обновлено",
     ],
     TAB_DAYS: [
         "Период", "Дата", "День недели", "Уникальные посетители", "Новые", "Визиты",
@@ -103,8 +111,10 @@ def local(value: datetime) -> datetime:
     return value.astimezone(LOCAL_TZ)
 
 
-def stamp(value: datetime) -> str:
-    return local(value).strftime("%d.%m.%Y %H:%M")
+def stamp(value: datetime) -> datetime:
+    """Время для таблицы: местное, без пояса — Google хранит дату без пояса,
+    а пояс таблицы (Asia/Almaty) задаёт `sheets.ensure_layout`."""
+    return local(value).replace(tzinfo=None, second=0, microsecond=0)
 
 
 def period_label(start: datetime, end: datetime) -> str:
@@ -139,10 +149,16 @@ def _bounced(visit: SiteVisit) -> bool:
 # ── Сборка ───────────────────────────────────────────────────────────────────
 
 
+STATUS_LIVE = "Идёт — обновляется"
+STATUS_FINAL = "Итог"
+
+
 @dataclass
 class Report:
     start: datetime
     end: datetime
+    label: str = ""
+    final: bool = True
     rows: dict[str, list[list[object]]] = field(default_factory=dict)
     visits: int = 0
 
@@ -166,11 +182,16 @@ def build_report(
     *,
     analyses: int | None = None,
     now: datetime | None = None,
+    final: bool = True,
 ) -> Report:
-    """Собрать все вкладки за [start, end). `analyses` — сколько выписок прислали на анализ."""
+    """Собрать все вкладки за [start, end). `analyses` — сколько выписок прислали на анализ.
+
+    `final=False` — период ещё идёт: «По» и дни считаются до текущего момента.
+    """
     now = now or datetime.now(UTC)
     label = period_label(start, end)
-    report = Report(start=start, end=end)
+    until = end if final else min(end, now)
+    report = Report(start=start, end=end, label=label, final=final)
 
     with visits_session() as db:
         all_visits = list(
@@ -214,7 +235,8 @@ def build_report(
 
     phones = sum(1 for v in visits if v.device_type == "Телефон")
     report.rows[TAB_SUMMARY] = [[
-        label, stamp(start), stamp(end), total["unique"], total["new"], total["unique"] - total["new"],
+        label, stamp(start), stamp(until), STATUS_FINAL if final else STATUS_LIVE,
+        total["unique"], total["new"], total["unique"] - total["new"],
         count, total["pageviews"], round(total["pageviews"] / count, 2) if count else 0,
         total["duration"], _minutes(sum(v.engaged_seconds or 0 for v in visits) / count) if count else 0,
         total["bounce"], analyses if analyses is not None else "—",
@@ -224,17 +246,16 @@ def build_report(
         len(staff_ids), len(bot_visits), stamp(now),
     ]]
 
-    # По дням.
-    by_day: dict[str, list[SiteVisit]] = defaultdict(list)
+    # По дням — для идущего периода только наступившие дни.
+    by_day: dict[date, list[SiteVisit]] = defaultdict(list)
     for v in visits:
-        by_day[local(v.started_at).strftime("%d.%m.%Y")].append(v)
+        by_day[local(v.started_at).date()].append(v)
     report.rows[TAB_DAYS] = []
     day = local(start)
-    while day < local(end):
-        key = day.strftime("%d.%m.%Y")
-        stats = _group_stats(by_day.get(key, []), new_ids)
+    while day < local(until):
+        stats = _group_stats(by_day.get(day.date(), []), new_ids)
         report.rows[TAB_DAYS].append([
-            label, key, WEEKDAYS[day.weekday()], stats["unique"], stats["new"], stats["visits"],
+            label, day.date(), WEEKDAYS[day.weekday()], stats["unique"], stats["new"], stats["visits"],
             stats["pageviews"], stats["duration"], stats["bounce"],
         ])
         day += timedelta(days=1)
@@ -357,9 +378,9 @@ def _aware(value: datetime) -> datetime:
 MAX_PERIODS_PER_PASS = 10
 
 
-def next_period(now: datetime | None = None) -> tuple[datetime, datetime] | None:
-    """Следующий период к отправке или None, если отправлять пока нечего."""
-    now = now or datetime.now(UTC)
+def _open_period() -> tuple[datetime, datetime] | None:
+    """Первый незакрытый период: от конца последнего итога (или от полуночи
+    первого визита) на `VISITS_REPORT_EVERY_DAYS` вперёд. Данных нет — None."""
     every = timedelta(days=visits_settings.report_every_days)
     with visits_session() as db:
         last_end = db.scalar(select(func.max(SiteReport.period_end)).where(SiteReport.status == "ok"))
@@ -370,8 +391,22 @@ def next_period(now: datetime | None = None) -> tuple[datetime, datetime] | None
             start = local_midnight(_aware(first))
         else:
             start = _aware(last_end)
-    end = start + every
-    return (start, end) if end <= now else None
+    return start, start + every
+
+
+def next_period(now: datetime | None = None) -> tuple[datetime, datetime] | None:
+    """Следующий период к закрытию (итогу) или None, если закрывать пока нечего."""
+    now = now or datetime.now(UTC)
+    period = _open_period()
+    return period if period is not None and period[1] <= now else None
+
+
+def current_period(now: datetime | None = None) -> tuple[datetime, datetime] | None:
+    """Идущий период — тот, что ещё не закончился. None, если данных нет или
+    сначала нужно закрыть пропущенные (это делает `run_due`)."""
+    now = now or datetime.now(UTC)
+    period = _open_period()
+    return period if period is not None and period[0] <= now < period[1] else None
 
 
 def run_due(
@@ -397,15 +432,67 @@ def run_due(
                 count = analyses(start, end)
             except Exception as exc:  # noqa: BLE001 — без числа анализов отчёт всё равно нужен
                 log.warning("visits: не посчитались анализы за период (%s)", exc)
-        report = build_report(start, end, analyses=count, now=now)
+        report = build_report(start, end, analyses=count, now=now, final=True)
         try:
             send(report)
         except Exception as exc:
             _log_report(start, end, "failed", str(exc)[:2000])
             raise
         _log_report(start, end, "ok", f"визитов: {report.visits}")
+        _last_live.clear()
         sent += 1
     return sent
+
+
+#: Отпечаток данных, с которым живой период ушёл в таблицу последний раз.
+#: В памяти процесса: после перезапуска первый проход просто запишет заново.
+_last_live: dict[str, tuple] = {}
+
+
+def _fingerprint(start: datetime, end: datetime, analyses: int | None) -> tuple:
+    """Изменилось ли что-то в периоде с прошлой записи — одним запросом по индексу."""
+    with visits_session() as db:
+        row = db.execute(
+            select(
+                func.count(SiteVisit.id),
+                func.coalesce(func.sum(SiteVisit.pageviews), 0),
+                func.coalesce(func.sum(SiteVisit.engaged_seconds), 0),
+                func.max(SiteVisit.last_activity_at),
+            ).where(SiteVisit.started_at >= start, SiteVisit.started_at < end)
+        ).one()
+    return (*row, analyses)
+
+
+def refresh_live(
+    send: Callable[[Report], None],
+    *,
+    analyses: Callable[[datetime, datetime], int] | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Переписать в таблице идущий период, если с прошлой записи он изменился.
+
+    Возвращает, была ли запись. Без изменений Google не трогается вовсе —
+    квота тратится только на новые данные.
+    """
+    now = now or datetime.now(UTC)
+    period = current_period(now)
+    if period is None:
+        return False
+    start, end = period
+    count = None
+    if analyses is not None:
+        try:
+            count = analyses(start, now)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("visits: не посчитались анализы за период (%s)", exc)
+    label = period_label(start, end)
+    mark = _fingerprint(start, end, count)
+    if _last_live.get(label) == mark:
+        return False
+    send(build_report(start, end, analyses=count, now=now, final=False))
+    _last_live.clear()
+    _last_live[label] = mark
+    return True
 
 
 def _log_report(start: datetime, end: datetime, status: str, detail: str) -> None:
@@ -425,10 +512,14 @@ def _log_report(start: datetime, end: datetime, status: str, detail: str) -> Non
 
 __all__ = [
     "LOCAL_TZ",
+    "STATUS_FINAL",
+    "STATUS_LIVE",
     "Report",
     "TABS",
     "build_report",
+    "current_period",
     "next_period",
     "period_label",
+    "refresh_live",
     "run_due",
 ]

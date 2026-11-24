@@ -6,6 +6,9 @@
     VISITS_SERVICE_ACCOUNT_JSON    — ключ сервисного аккаунта (JSON). Не задан —
                                      берётся GOOGLE_SERVICE_ACCOUNT_JSON
     VISITS_REPORT_EVERY_DAYS       — период отчёта в днях (по умолчанию 3)
+    VISITS_LIVE_SECONDS            — как часто переписывать в таблице идущий период,
+                                     если в нём что-то изменилось (по умолчанию 30;
+                                     0 — только итог раз в период)
     VISITS_RETENTION_DAYS          — сколько дней хранить сырые визиты (по умолчанию 90).
                                      Отчёты к этому времени давно в таблице.
     VISITS_HITS_PER_MINUTE         — потолок запросов учёта с одного адреса в минуту
@@ -41,6 +44,15 @@ class VisitsSettings(BaseSettings):
         validation_alias=AliasChoices("VISITS_SERVICE_ACCOUNT_JSON", "GOOGLE_SERVICE_ACCOUNT_JSON"),
     )
     report_every_days: float = Field(default=3.0, gt=0)
+    # Одна запись — два запроса к Google (лимит 60 в минуту на аккаунт), и
+    # уходит она только если в периоде что-то изменилось. Чаще 15 секунд
+    # смысла нет: Google сам показывает правку открытой таблице с задержкой.
+    live_seconds: int = Field(default=30, ge=0)
+
+    @field_validator("live_seconds")
+    @classmethod
+    def _live_floor(cls, value: int) -> int:
+        return 0 if value <= 0 else max(15, value)
     retention_days: int = Field(default=90, ge=7)
     hits_per_minute: int = Field(default=120, ge=10)
 
