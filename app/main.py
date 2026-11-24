@@ -196,6 +196,86 @@ async def _bbc_refresh_loop() -> None:
         live.set_waker(None)
 
 
+async def _analyzer_retention_loop() -> None:
+    """Каждые шесть часов: присланное на анализ старше недели удаляется.
+
+    Срок — `ANALYZER_RETENTION_DAYS` (по умолчанию 7). Что именно уходит и что
+    остаётся — в `app/services/retention_service.py`. Первый проход через две
+    минуты после старта: старт не ждёт чистки.
+    """
+    from app.api.routes import scanned
+    from app.services import retention_service
+
+    await asyncio.sleep(120)
+    while True:
+        try:
+            result = await asyncio.to_thread(retention_service.purge_expired)
+            scans = scanned.purge_expired_scans()
+            if result.total or scans:
+                log.info(
+                    "retention: удалено выписок %s, черновиков OCR %s, задач %s, "
+                    "файлов %s, сканов из памяти %s",
+                    result.sessions,
+                    result.ocr_reviews,
+                    result.jobs,
+                    result.files,
+                    scans,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — чистка не роняет приложение
+            log.warning("retention: чистка не прошла (%s)", exc)
+        await asyncio.sleep(6 * 3600)
+
+
+def _analyses_between(start, end) -> int:
+    """Сколько выписок прислали на анализ за период — конверсия для отчёта о посещениях.
+
+    Считается здесь, в корне сборки: учёт посещений про анализатор не знает.
+    Выписки живут неделю (`ANALYZER_RETENTION_DAYS`), а период отчёта — три
+    дня, так что к моменту отчёта все они ещё в базе.
+    """
+    from sqlalchemy import func, select
+
+    from app.core.database import db_session
+    from app.models.persistence import SessionRecord
+
+    with db_session() as session:
+        return session.scalar(
+            select(func.count())
+            .select_from(SessionRecord)
+            .where(SessionRecord.created_at >= start, SessionRecord.created_at < end)
+        ) or 0
+
+
+async def _visits_report_loop() -> None:
+    """Раз в час: созрел ли период отчёта о посещениях (3 дня) — если да, в таблицу.
+
+    Тем же проходом из базы уходят сырые визиты старше `VISITS_RETENTION_DAYS`.
+    Удаляемый модуль: снимается вместе с `app/visits`.
+    """
+    from app.visits import collect, report, sheets
+    from app.visits.config import visits_settings
+
+    await asyncio.sleep(180)
+    while True:
+        try:
+            removed = await asyncio.to_thread(collect.purge_old)
+            if removed:
+                log.info("visits: удалено старых записей учёта посещений: %s", removed)
+            if visits_settings.report_configured:
+                sent = await asyncio.to_thread(
+                    report.run_due, sheets.send_report, analyses=_analyses_between
+                )
+                if sent:
+                    log.info("visits: отчётов о посещениях отправлено: %s", sent)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — отчёт не роняет приложение
+            log.warning("visits: отчёт о посещениях не ушёл (%s: %s)", type(exc).__name__, exc)
+        await asyncio.sleep(3600)
+
+
 async def _contract_amendments_loop() -> None:
     """Раз в час: соглашения «с даты», чей день настал, становятся значением договора.
 
@@ -294,11 +374,24 @@ async def lifespan(_: FastAPI):
     except Exception as exc:  # noqa: BLE001
         log.warning("finance: фоновая задача договоров не запустилась: %s", exc)
 
+    # Присланное на анализ живёт неделю — дальше удаляется само.
+    retention_task = asyncio.create_task(_analyzer_retention_loop())
+
+    # Учёт посещений: отчёт раз в три дня в Google-таблицу (удаляемый модуль).
+    visits_task: asyncio.Task | None = None
+    try:
+        from app.visits.config import visits_settings
+
+        if visits_settings.enabled:
+            visits_task = asyncio.create_task(_visits_report_loop())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("visits: фоновая задача отчёта не запустилась: %s", exc)
+
     log.info("Application startup complete")
     try:
         yield
     finally:
-        for task in (bot_task, autocall_task, bbc_task, contracts_task):
+        for task in (bot_task, autocall_task, bbc_task, contracts_task, retention_task, visits_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

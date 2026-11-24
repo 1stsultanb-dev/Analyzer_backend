@@ -31,8 +31,11 @@ import app.finance.models  # noqa: F401 — раздел «Финансы» (у�
 import app.finance.accounts_model  # noqa: F401 — учётки раздела «Финансы»
 import app.finance.contracts.models  # noqa: F401 — реестр договоров «Финансов»
 
+from app.visits.db import VisitsBase  # учёт посещений (удаляемый модуль)
+import app.visits.models  # noqa: F401 — учёт посещений (удаляемый модуль)
+
 #: Конвертер в `public`, BBC в `bbc`, «Таблицы» в `webexcel`, «Книги» в `books`,
-#: «Финансы» в `finance`.
+#: «Финансы» в `finance`, учёт посещений в `visits`.
 #: Схема `webexcel` добавлена ревизией 0008 — до неё она жила вне учёта, и
 #: расхождение с моделями обнаружить было нечем.
 target_metadata = [
@@ -41,6 +44,7 @@ target_metadata = [
     WebExcelBase.metadata,
     BooksBase.metadata,
     FinanceBase.metadata,
+    VisitsBase.metadata,
 ]
 
 __all__ = ["target_metadata"]

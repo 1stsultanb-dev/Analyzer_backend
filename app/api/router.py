@@ -11,6 +11,7 @@ from app.bbc.routes import router as bbc_router  # BBC Dashboard (removable modu
 from app.api.routes.health import router as health_router
 from app.api.routes.scanned import router as scanned_router
 from app.api.routes.transforms import router as transforms_router
+from app.api.routes.visits import router as visits_router  # учёт посещений (удаляемый модуль)
 from app.webexcel.routes import router as webexcel_router  # «Таблицы» (удаляемый модуль)
 
 api_router = APIRouter()
@@ -32,3 +33,5 @@ api_router.include_router(finance_contracts_router)
 api_router.include_router(finance_people_router)
 api_router.include_router(finance_trash_router)
 api_router.include_router(finance_looks_router)
+# Учёт посещений: открыт без входа, пишет просмотры страниц (см. app/visits).
+api_router.include_router(visits_router)

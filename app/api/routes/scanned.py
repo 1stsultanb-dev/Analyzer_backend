@@ -8,6 +8,8 @@ POST /transforms/scan/{scan_id}/to-review → push into OCR review flow
 from __future__ import annotations
 
 import logging
+import threading
+import time
 import uuid
 from collections import OrderedDict
 from io import BytesIO
@@ -15,6 +17,7 @@ from io import BytesIO
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
+from app.core.config import settings
 from app.schemas.scanned import PreviewTableRow, ScanResponse, ScanResultMeta
 
 log = logging.getLogger(__name__)
@@ -24,22 +27,52 @@ router = APIRouter(tags=["scanned"])
 # Bounded in-memory LRU scan store. Each entry holds a full scanned document
 # (tables + cell data), so an unbounded dict would leak RAM and eventually OOM
 # the container. Keep only the most recent scans; older ones are evicted.
+#
+# Срок тот же, что у выписок в базе (`ANALYZER_RETENTION_DAYS`): скан — тоже
+# присланный документ, и в памяти процесса он не должен жить дольше, чем в базе.
+# Без срока последние 32 скана лежали бы до перезапуска, сколько бы ни прошло.
 _SCAN_STORE_MAX = 32
 _scan_store: "OrderedDict[str, dict]" = OrderedDict()
+_scan_lock = threading.Lock()
+
+
+def _scan_ttl_seconds() -> float:
+    return settings.analyzer_retention_days * 86400
 
 
 def _store_scan(scan_id: str, entry: dict) -> None:
-    _scan_store[scan_id] = entry
-    _scan_store.move_to_end(scan_id)
-    while len(_scan_store) > _SCAN_STORE_MAX:
-        _scan_store.popitem(last=False)
+    with _scan_lock:
+        _drop_expired_locked(time.monotonic())
+        _scan_store[scan_id] = {**entry, "stored_at": time.monotonic()}
+        _scan_store.move_to_end(scan_id)
+        while len(_scan_store) > _SCAN_STORE_MAX:
+            _scan_store.popitem(last=False)
 
 
 def _get_scan(scan_id: str) -> dict | None:
-    entry = _scan_store.get(scan_id)
-    if entry is not None:
+    with _scan_lock:
+        entry = _scan_store.get(scan_id)
+        if entry is None:
+            return None
+        if time.monotonic() - entry["stored_at"] > _scan_ttl_seconds():
+            del _scan_store[scan_id]
+            return None
         _scan_store.move_to_end(scan_id)
-    return entry
+        return entry
+
+
+def _drop_expired_locked(now: float) -> int:
+    ttl = _scan_ttl_seconds()
+    expired = [key for key, entry in _scan_store.items() if now - entry["stored_at"] > ttl]
+    for key in expired:
+        del _scan_store[key]
+    return len(expired)
+
+
+def purge_expired_scans() -> int:
+    """Выбросить из памяти сканы старше срока. Зовётся фоновой чисткой."""
+    with _scan_lock:
+        return _drop_expired_locked(time.monotonic())
 
 
 @router.post("/transforms/scan", response_model=ScanResponse)

@@ -55,6 +55,13 @@ class Settings(BaseSettings):
     scan_max_pages: int = 50
     scan_min_quality_score: float = 0.25
 
+    # Выписки, присланные на анализ (сайт и Telegram), хранятся столько дней и
+    # удаляются сами: разобранный документ целиком лежит в базе JSON-ом, и без
+    # срока база растёт с каждой загрузкой. См. `app/services/retention_service.py`.
+    analyzer_retention_days: float = Field(
+        default=7.0, gt=0, validation_alias=AliasChoices("ANALYZER_RETENTION_DAYS")
+    )
+
     # Currency rates — live from National Bank of Kazakhstan (auto-refreshed daily).
     fx_rates_enabled: bool = True
     fx_rates_url: str = Field(
@@ -198,7 +205,14 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins(self) -> list[str]:
-        return [item.strip() for item in self.allowed_origins.split(",") if item.strip()]
+        # Браузер присылает Origin без косой черты в конце, а в переменную её
+        # вписывают по привычке («https://finance-analyze.win/») — и такой адрес
+        # не совпал бы ни с одним запросом.
+        return [
+            item.strip().rstrip("/")
+            for item in self.allowed_origins.split(",")
+            if item.strip()
+        ]
 
 
 @lru_cache
